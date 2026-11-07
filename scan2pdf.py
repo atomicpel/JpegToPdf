@@ -4,6 +4,7 @@ scan2pdf — прототип: JPEG-сканы документов -> комп�
 
 Конвейер:
   1. JPEG -> оттенки серого
+  (шаги 2–3 выполняет общее ядро на C: core/s2p_page.c + core/jbig2_generic.c)
   2. Адаптивная бинаризация Sauvola (единственный шаг, где отбрасывается информация:
      серый/цвет превращаются в чёрно-белое; текст сохраняется)
   3. Собственный кодер JBIG2 generic region (core/jbig2_generic.c), без потерь
@@ -15,7 +16,6 @@ scan2pdf — прототип: JPEG-сканы документов -> комп�
 import argparse
 import ctypes
 import os
-import struct
 import subprocess
 import sys
 import time
@@ -24,76 +24,38 @@ import numpy as np
 from PIL import Image, ImageOps
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-CORE_SRC = os.path.join(HERE, "core", "jbig2_generic.c")
 CORE_LIB = os.path.join(HERE, "core", "libjbig2gen.so")
 
 
-# ---------- ядро на C ----------
+# ---------- ядро на C (общее с Android-приложением) ----------
+
+CORE_SRCS = [os.path.join(HERE, "core", f) for f in ("jbig2_generic.c", "s2p_page.c")]
+
 
 def load_core():
-    if not os.path.exists(CORE_LIB) or os.path.getmtime(CORE_LIB) < os.path.getmtime(CORE_SRC):
-        subprocess.run(["gcc", "-O2", "-shared", "-fPIC", "-o", CORE_LIB, CORE_SRC], check=True)
+    if not os.path.exists(CORE_LIB) or os.path.getmtime(CORE_LIB) < max(map(os.path.getmtime, CORE_SRCS)):
+        subprocess.run(["gcc", "-O2", "-shared", "-fPIC", "-o", CORE_LIB, *CORE_SRCS, "-lm"], check=True)
     lib = ctypes.CDLL(CORE_LIB)
-    lib.jbig2_encode_generic.restype = ctypes.c_long
-    lib.jbig2_encode_generic.argtypes = [ctypes.c_void_p, ctypes.c_int, ctypes.c_int,
-                                         ctypes.c_int, ctypes.POINTER(ctypes.c_void_p)]
-    lib.jbig2_free.argtypes = [ctypes.c_void_p]
+    lib.s2p_encode_page.restype = ctypes.c_long
+    lib.s2p_encode_page.argtypes = [ctypes.c_void_p, ctypes.c_int, ctypes.c_int, ctypes.c_int,
+                                    ctypes.c_int, ctypes.c_double, ctypes.c_int,
+                                    ctypes.POINTER(ctypes.c_void_p), ctypes.c_void_p]
+    lib.s2p_free.argtypes = [ctypes.c_void_p]
     return lib
 
 
-def mq_encode(lib, bitmap):
-    """bitmap: uint8 HxW, 1 = чёрный."""
-    bm = np.ascontiguousarray(bitmap, dtype=np.uint8)
-    h, w = bm.shape
-    out = ctypes.c_void_p()
-    n = lib.jbig2_encode_generic(bm.ctypes.data, w, h, 1, ctypes.byref(out))
-    if n < 0:
-        raise RuntimeError("JBIG2: ошибка кодирования")
-    data = ctypes.string_at(out, n)
-    lib.jbig2_free(out)
-    return data
-
-
-# ---------- бинаризация ----------
-
-def sauvola(gray, window, k=0.34, r=128.0):
-    """Адаптивный порог Sauvola через интегральные изображения. Возвращает 1 = чёрный."""
-    g = gray.astype(np.float64)
+def encode_page(lib, gray, dpi, k, window):
+    """gray: uint8 HxW. Возвращает (JBIG2-поток для PDF, ч/б страница: 1 = чёрный)."""
+    g = np.ascontiguousarray(gray, dtype=np.uint8)
     h, w = g.shape
-    half = window // 2
-    p = np.pad(g, ((half + 1, half), (half + 1, half)), mode="edge")
-    s1 = p.cumsum(0).cumsum(1)
-    s2 = (p * p).cumsum(0).cumsum(1)
-
-    def box(s):
-        return s[window:window + h, window:window + w] - s[:h, window:window + w] \
-             - s[window:window + h, :w] + s[:h, :w]
-
-    n = float(window * window)
-    mean = box(s1) / n
-    var = np.maximum(box(s2) / n - mean * mean, 0.0)
-    thr = mean * (1.0 + k * (np.sqrt(var) / r - 1.0))
-    return (g < thr).astype(np.uint8)
-
-
-# ---------- JBIG2-сегменты для PDF (встраиваемый формат, без заголовка файла) ----------
-
-def segment(num, seg_type, data, page=1):
-    hdr = struct.pack(">IBBBI", num, seg_type & 0x3F, 0x00, page, len(data))
-    return hdr + data
-
-
-def jbig2_page_stream(lib, bitmap, dpi):
-    h, w = bitmap.shape
-    ppm = int(round(dpi / 0.0254))  # точек на метр
-    page_info = struct.pack(">IIIIBH", w, h, ppm, ppm, 0x01, 0)  # флаг: lossless
-    region_info = struct.pack(">IIIIB", w, h, 0, 0, 0)
-    gen_flags = 0x08  # MMR=0, GBTEMPLATE=0, TPGDON=1
-    at = struct.pack(">8b", 3, -1, -3, -1, 2, -2, -2, -2)
-    mq = mq_encode(lib, bitmap)
-    # Сегмент «конец страницы» (49) в PDF не нужен: poppler на него ругается, jbig2enc его тоже не пишет
-    return (segment(0, 48, page_info)
-            + segment(1, 38, region_info + bytes([gen_flags]) + at + mq))
+    bm = np.empty((h, w), dtype=np.uint8)
+    out = ctypes.c_void_p()
+    n = lib.s2p_encode_page(g.ctypes.data, w, h, 1, dpi, k, window, ctypes.byref(out), bm.ctypes.data)
+    if n < 0:
+        raise RuntimeError("ошибка кодирования страницы")
+    data = ctypes.string_at(out, n)
+    lib.s2p_free(out)
+    return data, bm
 
 
 # ---------- минимальный PDF-писатель ----------
@@ -162,13 +124,11 @@ def main():
     t0 = time.time()
     for i, p in enumerate(a.images):
         gray, dpi = load_gray(p)
-        win = a.window or (int(dpi / 300 * 41) | 1)
-        bm = sauvola(gray, win, a.k)
+        data, bm = encode_page(lib, gray, dpi, a.k, a.window)
         if a.save_bitmaps:
             os.makedirs(a.save_bitmaps, exist_ok=True)
             Image.fromarray((1 - bm) * 255).convert("1").save(
                 os.path.join(a.save_bitmaps, "page%03d.png" % (i + 1)))
-        data = jbig2_page_stream(lib, bm, dpi)
         pages.append((data, bm.shape[1], bm.shape[0], dpi))
     write_pdf(a.out, pages)
 

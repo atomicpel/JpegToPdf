@@ -1,0 +1,84 @@
+name: Android APK
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - uses: subosito/flutter-action@v2
+        with:
+          flutter-version: '3.47.9'
+          channel: stable
+          cache: true
+
+      - name: Ядро на C — прототип и проверка декодером poppler
+        run: |
+          sudo apt-get update -qq && sudo apt-get install -y -qq poppler-utils
+          pip install -q numpy pillow
+          python3 tools/test_core.py
+
+      - name: Ядро через Dart FFI — тесты приложения
+        env:
+          S2P_LIB: ${{ runner.temp }}/libs2p.so
+          S2P_PGM: ${{ runner.temp }}/scan.pgm
+          S2P_OUT: ${{ runner.temp }}
+        run: |
+          gcc -O2 -shared -fPIC -o "$S2P_LIB" core/*.c -lm
+          python3 -c "from PIL import Image; Image.open('samples/test_scan.jpg').convert('L').save('$S2P_PGM')"
+          cd app
+          flutter pub get
+          flutter analyze --no-fatal-infos
+          flutter test
+          cd ..
+          python3 tools/check_dart_pdf.py "$S2P_OUT"
+
+      - name: Ключ подписи из секретов
+        env:
+          KS_B64: ${{ secrets.ANDROID_KEYSTORE_B64 }}
+          KS_PASS: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+        run: |
+          if [ -n "$KS_B64" ]; then
+            echo "$KS_B64" | base64 -d > app/android/release.jks
+            printf 'storeFile=release.jks\nstorePassword=%s\nkeyAlias=jpegtopdf\nkeyPassword=%s\n' "$KS_PASS" "$KS_PASS" > app/android/key.properties
+            echo "Подпись постоянным ключом"
+          else
+            echo "::warning::Секреты ключа не заданы — APK подписан временным debug-ключом"
+          fi
+
+      - name: Сборка APK
+        working-directory: app
+        run: |
+          flutter build apk --release --target-platform android-arm64 \
+            --build-name "0.1.${{ github.run_number }}" --build-number "${{ github.run_number }}"
+          cp build/app/outputs/flutter-apk/app-release.apk "$RUNNER_TEMP/JpegToPdf-0.1.${{ github.run_number }}.apk"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: JpegToPdf-apk
+          path: ${{ runner.temp }}/JpegToPdf-*.apk
+
+      - name: Релиз на GitHub
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "v0.1.${{ github.run_number }}" "$RUNNER_TEMP"/JpegToPdf-*.apk \
+            --title "JpegToPdf 0.1.${{ github.run_number }}" \
+            --notes "Сборка из ${GITHUB_SHA::7}. Android 7+, arm64."
